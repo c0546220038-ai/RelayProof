@@ -1,0 +1,40 @@
+name: Hardened ContinuitySeal source builder
+
+on:
+  workflow_call:
+
+permissions:
+  attestations: write
+  contents: read
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - name: Install hash-locked runtime
+        run: sh scripts/bootstrap_runtime.sh
+      - name: Test and compile
+        run: |
+          python -m unittest discover -s scripts -p 'test_*.py' -v
+          python -m compileall -q continuityseal scripts
+      - name: Build source archive twice and compare
+        run: sh scripts/package_source.sh dist/ContinuitySeal-0.1.0-public.zip
+      - name: Generate GitHub-hosted SLSA provenance
+        id: attest
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763
+        with:
+          subject-path: dist/ContinuitySeal-0.1.0-public.zip
+      - name: Preserve signed provenance bundle
+        run: cp "${{ steps.attest.outputs.bundle-path }}" dist/ContinuitySeal-0.1.0-provenance.jsonl
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: ContinuitySeal-source-candidate
+          path: |
+            dist/ContinuitySeal-0.1.0-public.zip
+            dist/ContinuitySeal-0.1.0-provenance.jsonl
+          if-no-files-found: error
+          retention-days: 1

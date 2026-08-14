@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools==84.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "continuityseal"
+version = "0.1.0"
+description = "A local, evidence-bound crash recovery benchmark for AI agent handoffs."
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "Apache-2.0"}
+authors = [{name = "Selqira"}]
+dependencies = ["cryptography==50.0.0"]
+
+[project.scripts]
+continuityseal-benchmark = "continuityseal.benchmark:main"
+
+[tool.setuptools]
+packages = ["continuityseal"]

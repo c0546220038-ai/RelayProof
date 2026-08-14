@@ -1,0 +1,154 @@
+name: Source release gate
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "continuityseal-candidate"
+    tags:
+      - "v*"
+
+permissions: {}
+
+jobs:
+  source-validation:
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/continuityseal-builder.yml
+
+  provenance-verification:
+    needs: source-validation
+    permissions:
+      actions: read
+      attestations: read
+      contents: read
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0
+        with:
+          name: ContinuitySeal-source-candidate
+          path: ${{ runner.temp }}/continuityseal-verified
+      - name: Install immutable GitHub attestation verifier
+        run: |
+          set -eu
+          archive="$RUNNER_TEMP/gh_2.94.0_linux_amd64.tar.gz"
+          curl --fail --location --proto '=https' \
+            https://github.com/cli/cli/releases/download/v2.94.0/gh_2.94.0_linux_amd64.tar.gz \
+            --output "$archive"
+          echo 'a757f1ba6db18f4de8cbadb244843a5f89bc75b5e7c6fc127d2bd77fbd12ed62  '"$archive" | sha256sum --check --strict
+          tar -xzf "$archive" -C "$RUNNER_TEMP"
+      - name: Verify hosted provenance and exact identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          candidate="$RUNNER_TEMP/continuityseal-verified/ContinuitySeal-0.1.0-public.zip"
+          bundle="$RUNNER_TEMP/continuityseal-verified/ContinuitySeal-0.1.0-provenance.jsonl"
+          verifier="$RUNNER_TEMP/gh_2.94.0_linux_amd64/bin/gh"
+          "$verifier" attestation verify "$candidate" \
+            --repo c0546220038-ai/RelayProof \
+            --bundle "$bundle" \
+            --signer-workflow c0546220038-ai/RelayProof/.github/workflows/continuityseal-builder.yml \
+            --source-ref refs/heads/continuityseal-candidate \
+            --source-digest "$GITHUB_SHA" \
+            --deny-self-hosted-runners \
+            --predicate-type https://slsa.dev/provenance/v1 \
+            --format json > "$RUNNER_TEMP/verified-provenance.json"
+          python3 - "$RUNNER_TEMP/verified-provenance.json" "$GITHUB_SHA" "$GITHUB_RUN_ID" <<'PY'
+          import json, sys
+          value = json.load(open(sys.argv[1], encoding="utf-8"))
+          if not isinstance(value, list) or len(value) != 1:
+              raise SystemExit("expected exactly one verified attestation")
+          statement = value[0]["verificationResult"]["statement"]
+          predicate = statement["predicate"]
+          github = predicate["buildDefinition"]["internalParameters"]["github"]
+          dependencies = predicate["buildDefinition"]["resolvedDependencies"]
+          invocation = predicate["runDetails"]["metadata"]["invocationId"]
+          if github.get("runner_environment") != "github-hosted":
+              raise SystemExit("provenance was not produced on a GitHub-hosted runner")
+          if not any(item.get("digest", {}).get("gitCommit") == sys.argv[2] for item in dependencies):
+              raise SystemExit("provenance commit does not match GITHUB_SHA")
+          if f"/actions/runs/{sys.argv[3]}/" not in invocation:
+              raise SystemExit("provenance invocation does not match GITHUB_RUN_ID")
+          PY
+
+  external-aegis-gate:
+    needs: [source-validation, provenance-verification]
+    permissions:
+      actions: read
+      contents: read
+    runs-on: [self-hosted, aegis]
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0
+        with:
+          name: ContinuitySeal-source-candidate
+          path: ${{ runner.temp }}/continuityseal-candidate
+      - name: Bind checkout and built artifact to external subjects
+        env:
+          AEGIS_RELEASE_ROOT: ${{ vars.AEGIS_RELEASE_ROOT }}
+        run: |
+          set -eu
+          test -n "$AEGIS_RELEASE_ROOT"
+          candidate="$RUNNER_TEMP/continuityseal-candidate/ContinuitySeal-0.1.0-public.zip"
+          hosted_provenance="$RUNNER_TEMP/continuityseal-candidate/ContinuitySeal-0.1.0-provenance.jsonl"
+          external_artifact="$AEGIS_RELEASE_ROOT/subjects/ContinuitySeal-0.1.0-public.zip"
+          source_manifest="$AEGIS_RELEASE_ROOT/subjects/source-tree.json"
+          workflow_manifest="$AEGIS_RELEASE_ROOT/subjects/release-workflow.json"
+          test -f "$candidate"
+          test -s "$hosted_provenance"
+          test -f "$external_artifact"
+          test -f "$source_manifest"
+          test -f "$workflow_manifest"
+          declared_artifact=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["source_zip_sha256"])' "$source_manifest")
+          test "$(sha256sum "$candidate" | awk '{print $1}')" = "$declared_artifact"
+          test "$(sha256sum "$external_artifact" | awk '{print $1}')" = "$declared_artifact"
+          cmp "$candidate" "$external_artifact"
+          external_tree=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["tree_sha1"])' "$source_manifest")
+          test -n "$external_tree"
+          test "$(git show -s --format=%T "$GITHUB_SHA")" = "$external_tree"
+          python3 - "$workflow_manifest" <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+          import sys
+
+          manifest = json.load(open(sys.argv[1], encoding="utf-8"))
+          expected = {
+              ".github/workflows/continuityseal-builder.yml",
+              ".github/workflows/release-source.yml",
+          }
+          if manifest.get("schema") != "continuityseal-release-workflow/1":
+              raise SystemExit("unexpected workflow manifest schema")
+          files = manifest.get("files")
+          if not isinstance(files, dict) or set(files) != expected:
+              raise SystemExit("workflow manifest has an unexpected file set")
+          for raw_path in sorted(expected):
+              entry = files[raw_path]
+              if not isinstance(entry, dict) or set(entry) != {"sha256"}:
+                  raise SystemExit(f"invalid workflow entry: {raw_path}")
+              actual = hashlib.sha256(Path(raw_path).read_bytes()).hexdigest()
+              if entry["sha256"] != actual:
+                  raise SystemExit(f"workflow hash mismatch: {raw_path}")
+          PY
+      - name: Verify pinned external sovereign gate
+        env:
+          AEGIS_POLICY_SHA256: ${{ vars.AEGIS_POLICY_SHA256 }}
+          AEGIS_RELEASE_ROOT: ${{ vars.AEGIS_RELEASE_ROOT }}
+          AEGIS_TRUST_ROOT: ${{ vars.AEGIS_TRUST_ROOT }}
+        run: |
+          test -n "$AEGIS_POLICY_SHA256"
+          test -n "$AEGIS_RELEASE_ROOT"
+          test -n "$AEGIS_TRUST_ROOT"
+          test -f "$AEGIS_RELEASE_ROOT/aegis/release.json"
+          python /opt/aegis/aegis_gate.py verify \
+            --project-root "$AEGIS_RELEASE_ROOT" \
+            --trust-root "$AEGIS_TRUST_ROOT" \
+            --policy "$AEGIS_TRUST_ROOT/sovereign-policy.json" \
+            --expected-policy-sha256 "$AEGIS_POLICY_SHA256" \
+            --release "$AEGIS_RELEASE_ROOT/aegis/release.json" \
+            --receipt "$AEGIS_RELEASE_ROOT/aegis/gate-receipt.json"
